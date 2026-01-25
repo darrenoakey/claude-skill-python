@@ -25,14 +25,30 @@ local/           # gitignored large downloads/artifacts
 - Shallow structure preferred. Once you use subdirectories, place peer modules at the same nesting level.
 - Max 20 files per directory.
 - No experimental scripts or alt versions at root or anywhere else; use branches for iteration.
+- **output/ and local/ must be accessed relative to the code, not the current working directory.** The caller's cwd is never a thing. Use `Path(__file__).parent` or similar to resolve paths relative to the script location.
 
 **Example `.gitignore`**
 ```
 output/
 local/
+.venv/
 __pycache__/
 *.pyc
 ```
+
+---
+
+## Virtual Environment
+
+**Always use venv** as the environment manager. No conda, no poetry, no pipenv.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Critical: venv is behind `run`** - callers of `run` should never need to know whether a venv is being used. They just call `./run` or `~/bin/projectname`. The `run` script is responsible for activating the venv internally if one exists.
 
 ---
 
@@ -278,15 +294,50 @@ pytest -W error -q src/text/wrap_test.py::test_wrap_text > output/testing/wrap_t
 
 The run tool is a **Python file named `run`** (no `.py` extension) using **argparse**. It orchestrates by invoking Python modules/commands, not shelling out core logic. It must not contain business logic.
 
+**venv activation is internal to run** - if the project uses a venv, `run` activates it before doing anything else. Callers never activate venv themselves.
+
+**~/bin wrapper script** - when creating a `run` for a project, also create a wrapper script in `~/bin/` so the tool is globally accessible:
+
+```bash
+# ~/bin/myproject (2 lines, executable)
+#!/bin/bash
+exec ~/src/myproject/run "$@"
+```
+
+This means:
+- `~/src/myproject/run` is the real implementation
+- `~/bin/myproject` is the global entry point that delegates to it
+- Users call `myproject check` from anywhere, never needing to cd or activate venv
+
 **Example `run` (Python argparse)**
 ```python
 #!/usr/bin/env python3
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-TEST_OUT = Path("output/testing")
+# ##################################################################
+# paths relative to this script, not cwd
+SCRIPT_DIR = Path(__file__).parent.resolve()
+TEST_OUT = SCRIPT_DIR / "output/testing"
+VENV_DIR = SCRIPT_DIR / ".venv"
+
+# ##################################################################
+# activate venv if present (before any imports that need it)
+def activate_venv() -> None:
+    if VENV_DIR.exists() and "VIRTUAL_ENV" not in os.environ:
+        activate = VENV_DIR / "bin" / "activate_this.py"
+        if activate.exists():
+            exec(open(activate).read(), {"__file__": str(activate)})
+        else:
+            # Alternative: re-exec with venv python
+            venv_python = VENV_DIR / "bin" / "python"
+            if venv_python.exists():
+                os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+activate_venv()
 
 # ##################################################################
 # run
@@ -298,18 +349,17 @@ def _run(cmd: list[str]) -> int:
 # test
 # the user ran 'run test' - so we want to run all the pytests
 def command_test(args: argparse.Namespace) -> int:
-    # Per-file test only; write logs under output/testing
+    # Per-file test only; write logs under output/testing (relative to script, not cwd)
     TEST_OUT.mkdir(parents=True, exist_ok=True)
     target = args.target
-    log = TEST_OUT / (target.replace('/', '_').replace('::','_') + ".log")
-    rc = _run(["pytest", "-q", target, "--maxfail=1", "--disable-warnings"])
+    rc = _run(["pytest", "-q", str(SCRIPT_DIR / target), "--maxfail=1", "--disable-warnings"])
     return rc
 
 # ##################################################################
 # lint
 # the user ran 'run lint' - so we want to run ruff
 def command_lint(_: argparse.Namespace) -> int:
-    return _run(["ruff", "check", "--line-length", "120"])
+    return _run(["ruff", "check", "--line-length", "120", str(SCRIPT_DIR)])
 
 # ##################################################################
 # check
