@@ -7,6 +7,18 @@ description: Python development standards and practices for zero-fabrication, te
 
 This skill provides comprehensive Python development standards focused on real implementations, rigorous testing, and zero fabrication.
 
+## GUI Development
+
+**If the task involves ANY GUI work** (desktop app, window, dialog, widget, display, visualization), you MUST read and follow `gui.md` in this skill directory BEFORE writing any GUI code. This includes:
+- Creating a new GUI application
+- Adding windows, dialogs, or visual components to an existing app
+- Modifying styling, layout, colors, or fonts
+- Adding icons or images to an application
+
+The GUI standards ensure all desktop applications on this system share a consistent visual language, framework (PySide6), and architectural approach.
+
+---
+
 ## Repository & Project Layout
 
 **Required structure**
@@ -42,13 +54,12 @@ __pycache__/
 
 **Always use venv** as the environment manager. No conda, no poetry, no pipenv.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+**Critical architecture: `run` is OUTSIDE the venv.** `run` itself runs with the ambient system Python. Its job is to:
+1. **Create the venv** if it doesn't exist (`python3 -m venv .venv`)
+2. **Install requirements** into the venv (`pip install -r requirements.txt`)
+3. **Delegate everything** into the venv via `os.execv` into the venv Python
 
-**Critical: venv is behind `run`** - callers of `run` should never need to know whether a venv is being used. They just call `./run` or `~/bin/projectname`. The `run` script is responsible for activating the venv internally if one exists.
+Callers never create, activate, or think about the venv. They just call `./run` or `~/bin/projectname` from anywhere. The venv is a local implementation detail that `run` manages transparently.
 
 ---
 
@@ -290,111 +301,49 @@ pytest -W error -q src/text/wrap_test.py::test_wrap_text > output/testing/wrap_t
 
 ---
 
-## Run Facade (Python Argparse Only)
+## Run Facade (Minimal Delegation Only)
 
-The run tool is a **Python file named `run`** (no `.py` extension) using **argparse**. It orchestrates by invoking Python modules/commands, not shelling out core logic. It must not contain business logic.
+The `run` script is a **Python file named `run`** (no `.py` extension, executable). It is a **pure facade** — it does no work, no argument parsing, and contains no business logic. Its only jobs are:
 
-**venv activation is internal to run** - if the project uses a venv, `run` activates it before doing anything else. Callers never activate venv themselves.
+1. Ensure the venv exists (create it if not)
+2. Ensure requirements are installed
+3. Pass ALL arguments through to the actual entry point inside the venv
 
-**~/bin wrapper script** - when creating a `run` for a project, also create a wrapper script in `~/bin/` so the tool is globally accessible:
+**`run` must never:** parse arguments, implement subcommands, or contain any logic beyond bootstrapping. All of that lives in the real source code.
+
+**`~/bin wrapper script`** - also create a wrapper in `~/bin/` for global access:
 
 ```bash
-# ~/bin/myproject (2 lines, executable)
+# ~/bin/myproject (executable, 2 lines)
 #!/bin/bash
 exec ~/src/myproject/run "$@"
 ```
 
-This means:
-- `~/src/myproject/run` is the real implementation
-- `~/bin/myproject` is the global entry point that delegates to it
-- Users call `myproject check` from anywhere, never needing to cd or activate venv
-
-**Example `run` (Python argparse)**
+**Example `run`:**
 ```python
 #!/usr/bin/env python3
-import argparse
-import os
-import subprocess
-import sys
+# run — pure bootstrap facade. No logic here. Everything delegates to src/main.py.
+import os, subprocess, sys
 from pathlib import Path
 
-# ##################################################################
-# paths relative to this script, not cwd
 SCRIPT_DIR = Path(__file__).parent.resolve()
-TEST_OUT = SCRIPT_DIR / "output/testing"
-VENV_DIR = SCRIPT_DIR / ".venv"
+VENV = SCRIPT_DIR / ".venv"
+REQS = SCRIPT_DIR / "requirements.txt"
+PYTHON = VENV / "bin" / "python"
 
-# ##################################################################
-# activate venv if present (before any imports that need it)
-def activate_venv() -> None:
-    if VENV_DIR.exists() and "VIRTUAL_ENV" not in os.environ:
-        activate = VENV_DIR / "bin" / "activate_this.py"
-        if activate.exists():
-            exec(open(activate).read(), {"__file__": str(activate)})
-        else:
-            # Alternative: re-exec with venv python
-            venv_python = VENV_DIR / "bin" / "python"
-            if venv_python.exists():
-                os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+# Create venv if missing
+if not VENV.exists():
+    subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
 
-activate_venv()
+# Install / sync requirements
+if REQS.exists():
+    subprocess.run([str(PYTHON), "-m", "pip", "install", "-q", "-r", str(REQS)], check=True)
 
-# ##################################################################
-# run
-# executes a shell command
-def _run(cmd: list[str]) -> int:
-    return subprocess.call(cmd)
-
-# ##################################################################
-# test
-# the user ran 'run test' - so we want to run all the pytests
-def command_test(args: argparse.Namespace) -> int:
-    # Per-file test only; write logs under output/testing (relative to script, not cwd)
-    TEST_OUT.mkdir(parents=True, exist_ok=True)
-    target = args.target
-    rc = _run(["pytest", "-q", str(SCRIPT_DIR / target), "--maxfail=1", "--disable-warnings"])
-    return rc
-
-# ##################################################################
-# lint
-# the user ran 'run lint' - so we want to run ruff
-def command_lint(_: argparse.Namespace) -> int:
-    return _run(["ruff", "check", "--line-length", "120", str(SCRIPT_DIR)])
-
-# ##################################################################
-# check
-# the user ran 'run check' - so we want to run dazpycheck
-def command_check(_: argparse.Namespace) -> int:
-    # Full-suite and gates only at the end
-    return _run(["dazpycheck"])
-
-# ##################################################################
-# main
-# the main run app - just parse the arguments and delegate to the right thing
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_test = sub.add_parser("test", help="Run a single test target (file or test function)")
-    p_test.add_argument("target", help="e.g. src/text/wrap_test.py::test_wrap_text")
-    p_test.set_defaults(func=command_test)
-
-    p_lint = sub.add_parser("lint", help="Run linter")
-    p_lint.set_defaults(func=command_lint)
-
-    p_check = sub.add_parser("check", help="Run full suite and gates (dazpycheck)")
-    p_check.set_defaults(func=command_check)
-
-    args = parser.parse_args(argv)
-    return args.func(args)
-
-# ##################################################################
-#
-# standard python pattern for dispatching main
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+# Hand off entirely — this process is replaced, no return
+os.execv(str(PYTHON), [str(PYTHON), str(SCRIPT_DIR / "src" / "main.py")] + sys.argv[1:])
 ```
+
+The actual `src/main.py` (or whatever the entry point is) handles all argparse, subcommands, and logic. `run` only ensures the venv is ready and then disappears via `execv`.
 
 ---
 
@@ -532,3 +481,93 @@ def execute_n8n_workflow(workflow_id: str, data: dict = None) -> dict:
 - Write test output to `output/testing/`
 - Clean the repository and re-run checks until zero errors
 - `dazpycheck` must be green before any commit
+
+---
+
+## Gotchas & Known Pitfalls
+
+### FastAPI
+- `{path:path}` route parameters are greedy — they swallow sub-paths like `/history`. Register specific sub-routes BEFORE catch-all `{path:path}` routes, or they'll never match.
+- `TestClient` streaming (SSE): `iter_bytes()`/`iter_lines()` block indefinitely on infinite SSE generators. Use a real uvicorn server in a `threading.Thread` with `server.should_exit = True` for cleanup. Don't use multiprocessing for test servers on macOS (spawn context can't pickle local functions).
+- `async def` endpoints with synchronous DB calls block the event loop. Use plain `def` instead — FastAPI auto-runs them in a threadpool. Critical when SSE streaming coexists with slow queries: one blocked query stalls ALL concurrent SSE clients.
+- `StaticFiles` mount doesn't set cache headers. For immutable content-hash caching, replace with a custom route that sets `Cache-Control: public, max-age=31536000, immutable` and use `resolve()` + prefix check for path traversal.
+- httpx (used by `TestClient`) deprecated per-request `cookies=` parameter. With `-W error`, tests setting `cookies={"key": "val"}` on individual `client.get()` calls will fail as `DeprecationWarning`. Fix: set cookies on the client instance via `client.cookies.set("key", "val")` before making requests.
+- `@app.on_event("startup")` is deprecated in favor of `lifespan` context manager: `@asynccontextmanager async def lifespan(app): ... yield ...` passed to `FastAPI(lifespan=lifespan)`.
+
+### SQLAlchemy
+- SQLAlchemy + Lambda + PostgreSQL: always use `NullPool` (`from sqlalchemy.pool import NullPool; create_engine(url, poolclass=NullPool)`). Lambda concurrency creates many processes each with their own pool — exhausting `max_connections`. NullPool opens/closes per request.
+- SQLAlchemy dual-DB pattern (SQLite for tests, PostgreSQL for prod): guard DB-specific code with `if engine.url.drivername.startswith("sqlite")` (not `"postgresql"`) for robustness to driver changes.
+
+### SQLite
+- Multiple connection factories: if you have more than one function that creates connections (e.g., thread-local vs fresh), ensure ALL of them set critical PRAGMAs (`busy_timeout`, `journal_mode`). Missing `busy_timeout` causes immediate "database is locked" errors instead of waiting.
+- Per-request `connect()`/`close()` in web servers adds ~500ms overhead. Use thread-local connections (`threading.local()`) for the server process.
+- `CREATE TABLE IF NOT EXISTS` does NOT modify existing tables — won't add new columns. Use `ALTER TABLE ADD COLUMN` in a migration function.
+- Computed/normalized columns: when the normalization function changes, recompute ALL rows (not just NULLs). Migration that only fills `WHERE normalized_col IS NULL` silently leaves stale values from the old algorithm.
+- `UPDATE ... SET x = ?` on a table with `UNIQUE(name, x)` will fail if the target already has that name. When merging parent entities, handle child UNIQUE constraints: find-or-merge children first, then reassign remaining, then delete the source parent.
+
+### Playwright / Testing
+- `page.goto()` defaults to `wait_until="load"` which waits for ALL resources (images). On pages with many lazy-loaded images, this times out. Use `wait_until="domcontentloaded"` for heavy image grids.
+- `expect()` has its own timeout separate from `page.set_default_timeout()`. Use `expect.set_options(timeout=N)` to configure assertion timeouts globally. Without this, `expect(locator).to_be_visible()` uses the default 5s.
+- E2E: when a UI click triggers an API fetch that updates the DOM, use `page.expect_response(lambda r: ...)` as a context manager around the click to wait for the specific response before asserting DOM state.
+- `Path.rglob()` on network volumes (NFS/SMB) is extremely slow. For tests, iterate top-level dirs and rglob within each subdirectory with an early-exit limit instead of scanning the entire tree.
+- Tests spawning tmux sessions: user shell init files (.zshrc, .bashrc) can block indefinitely. Fix: set `HOME` to a temp dir and `SHELL=/bin/bash` in TestMain to skip init files entirely.
+- Tests for fire-and-forget launchers (`subprocess.Popen(["open", url])`) must NEVER pass valid URLs — they actually open in the browser on every test run. Only test rejection of invalid inputs.
+- Pytest `scope="module"` fixtures that bind ports stay alive for the entire module. Standalone tests in the same file that start their own servers MUST use a different port, or the health check will hit the fixture's server while the new server silently fails to bind.
+
+### Python stdlib / Runtime
+- `os.walk()` on NFS can hang indefinitely on a single stalled directory. Replace with manual BFS + `os.listdir()` in a daemon thread with `queue.get(timeout=N)` so stalled dirs are skipped.
+- `datetime.fromisoformat()` on RFC3339 strings returns tz-aware datetimes; `datetime.now()` returns naive. Comparing them raises "can't compare offset-naive and offset-aware datetimes". Fix at the ingestion point: `.astimezone().replace(tzinfo=None)`.
+- `run` scripts using `os.execv` to activate a venv: MUST compare `Path(sys.executable).resolve()` to the venv python path before re-exec. Without this check the script re-execs forever (infinite loop) because `VIRTUAL_ENV` env var is not set by execv.
+- Optional-module try/except import pattern (`try: import foo; except ImportError: foo = None`) causes Pyright to flag all `foo.bar()` calls as `union-attr` errors. Fix: add `# type: ignore[union-attr]` on each usage site.
+- Python 3.14 + Homebrew: `cffi` and `pycparser` may have broken RECORD files preventing `pip install --force-reinstall`. Use `pip install --ignore-installed <pkg>` to work around.
+- Python wrapper scripts importing from deep internal package paths are fragile to version upgrades — packages reorganize internal structure between versions. Prefer importing from stable public APIs.
+- Python strings embedded in JS templates: `\uD83D\uDE80` (UTF-16 surrogate pairs) are invalid in Python UTF-8 strings and cause `UnicodeEncodeError: surrogates not allowed` on file write. Use full 8-digit escapes: `\U0001F680` (🚀).
+- `dict.get("key", "")` returns `None` (not the default) when the key IS present but its value is `None`. Use `(d.get("key") or "")` to guard against `None` values when chaining `.strip()` or other string methods.
+- Python 3.14 `sqlite3.Cursor` does NOT support context manager protocol (`with conn.cursor() as cur:` raises TypeError). Use `cur = conn.cursor(); try: ... finally: cur.close()` instead.
+- `asyncio.run()` in a sync pytest test fails with "cannot be called from a running event loop" when pytest-asyncio is active. Fix: run the coroutine in a `ThreadPoolExecutor` thread (each thread gets its own event loop): `pool.submit(asyncio.run, coro()).result(timeout=N)`.
+- Bulk Python module rename via string `.replace("old_name.", "new_name.")` will double-hit strings that already contain `new_name.old_name.`. Do the rename in a single pass with exact `from old_name` / `import old_name` patterns first, then run a cleanup pass for doubled prefixes.
+
+### Claude / AI SDK
+- Claude Code SDK `async for msg in query()` crashes on unknown message types (e.g., `rate_limit_event`) with `MessageParseError`. Fix: use manual `__anext__()` in a while loop with try/except, catching and skipping unknown types. Also: `ResultMessage` has `.result` (str) not `.content` — skip it when collecting response text.
+- `claude_agent_sdk` from sync code: wrap with `asyncio.run(_ask_claude(prompt))` where `_ask_claude` is `async def`. Never use `subprocess.run(["claude", ...])` — it fails inside Claude Code sessions.
+- `claude_agent_sdk.ProcessError` is raised when the claude CLI exits non-zero — can happen during teardown even after tools executed successfully. Catch it in the `async for` loop and verify operation success via DB/API rather than treating it as a deployment failure.
+- Claude Agent SDK `query()` from a FastAPI background thread spawned from a sync endpoint: use `ThreadPoolExecutor` + `asyncio.run()` inside the thread (can't use `asyncio.run()` directly if already in an async context).
+
+### Pyright / Type Checking
+- Pyright + async generators: an ABC method returning `AsyncIterator[str]` must be declared as `def stream(...)` (NOT `async def`). Subclasses implement as `async def stream(...)` with `yield`. If the base is `async def`, pyright sees a type mismatch between `Coroutine[..., AsyncIterator[str]]` and `AsyncIterator[str]`.
+- Pyright `reportMissingImports` warnings for installed packages: caused by missing `py.typed` marker. Fix with `# pyright: ignore[reportMissingImports]` on the import line. Don't touch `site-packages/` — it's fragile and gets blown away on reinstall.
+
+### macOS / PyObjC
+- `pyobjc-framework-Quartz` is NOT installed by default. Needed for `CGWindowListCopyWindowInfo` native window capture: `pip install pyobjc-framework-Quartz`.
+- PyObjC bridge calls are expensive in bulk. When processing large collections of ObjC objects (e.g., EventKit reminders), do lightweight filtering/sorting on raw ObjC objects first, then convert only the needed subset to Python dataclasses. Also use direct ID lookups (`calendarItemWithIdentifier_`) instead of fetching all items and iterating.
+- macOS screen sleep/wake: use PyObjC `NSWorkspace.sharedWorkspace().notificationCenter().addObserverForName_object_queue_usingBlock_("NSWorkspaceScreensDidSleepNotification", None, None, callback)`. Requires `pyobjc-framework-Cocoa`. Callbacks run on the main thread — safe to set flags and call `QTimer.singleShot`. Wrap in try/except for graceful degradation.
+- EventKit EKEventStore must be a process-level singleton. Creating new instances per poll cycle causes EventKit to throttle and deny access after ~2 minutes. Cache as module-level variable; create and authorize once at startup.
+- PySide6 blocking operations in QTimer callbacks freeze the UI. Use `threading.Thread(daemon=True)` + `Signal(object)` to run work off-thread and deliver results via signal emission.
+- `keyring` package in macOS venvs requires `keyrings.alt` backend installed in the same venv — otherwise `keyring.get_password()` returns None silently (no error).
+- Homebrew Python code-signing breakage: `brew upgrade` can leave Python dylibs with invalid Team IDs, causing `dyld` load failures. Fix: `brew reinstall python@3.XX`.
+
+### ML / AI Models
+- Neural network integration: always check the original training code's input normalization (e.g., `Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))` for [-1,1]). Mismatched input ranges cause systematic brightness/contrast corruption. Compare per-channel stats (mean, std, min, max) against the source image to verify.
+- Long-running ML generation (video/audio): use subprocess-per-chunk for memory isolation. MLX/PyTorch models leak memory across iterations even with `del` + `gc.collect()`. Save intermediate results as `.npy` files for resume support (check existence before generating).
+- HuggingFace MLX Community Whisper repos use `-mlx` suffix: `mlx-community/whisper-base-mlx`, `whisper-small-mlx`. Exception: `whisper-large-v3-turbo` has no suffix. Always verify repo exists before hardcoding.
+- fastembed (BAAI/bge-small-en-v1.5, 384-dim): first call per process downloads/loads model (~30s if not cached, ~3s if cached). In daemon/watcher processes, expect an apparent stall on the first chunk indexed.
+- When chaining sequential large ML model calls (e.g. generation then background removal), call `gc.collect()` between them to release the first model's memory before loading the second. Wrap the second call in a retry loop (3 attempts, ~10s delay) to handle transient OOM kills — OOM kills skip Python `finally` blocks so temp files persist and can be retried.
+
+### Web / APIs
+- Browser `getUserMedia()` requires a user gesture context (click/tap handler). Calling it on page load or outside a gesture silently returns "Permission denied" without ever prompting. Always init mic inside a click handler. Web Audio nodes (MediaStreamSource, AnalyserNode, ScriptProcessorNode) must be stored at module/global scope — local variables get garbage collected, causing `onaudioprocess` callbacks to silently stop firing.
+- OAuth token refresh: use proactive refresh (10 minutes before expiry) with background checking (every 5 minutes) and minimum refresh interval (30 seconds) to prevent loops. Store access_token, refresh_token, and expiry separately with last_refresh timestamp.
+- Wikidata SPARQL endpoint: for bulk queries (100K+ results), request CSV format (`Accept: text/csv`) instead of JSON — more reliable and faster to parse with Python's `csv` module.
+- YouTube playlists: yt-dlp `--flat-playlist --dump-json` returns titles in the flat listing — pre-filter by title before fetching full metadata to avoid downloading data for irrelevant videos.
+- Open Library author search API can return wrong authors. Always validate the returned name matches the searched name before using bio/photo.
+
+### Services / Processes
+- uvicorn `--reload` on macOS uses `multiprocessing.spawn` to create parent/child process pairs. After extended runtime (hours/days), the worker subprocess can hang (bound to port but not serving). Never use `--reload` for daemon-managed services — the daemon handles restarts.
+- JSONL watcher daemons: always cap lines processed per file per poll cycle (e.g., 150 max). Without a cap, a single large file starves all other files from ever being processed. Store byte offset after each batch so next poll resumes from where it stopped.
+- SSE streaming with snapshot-then-live: when connection drops and reconnects, the UI MUST clear stale data before the new snapshot arrives. Wire a `reconnecting` callback that clears state, fired just before the retry delay.
+- Process group killing: when processes are started with `start_new_session=True`, killing the parent leaves orphaned children. Use `os.killpg(os.getpgid(pid), signal)` to kill the entire group. Critical for services that spawn workers (uvicorn, gunicorn, etc).
+- Port pre-flight checks: before starting any service that binds a port, check availability with a socket bind attempt. Include `lsof -i :<port>` in error messages for diagnosis.
+
+### Media (ffmpeg)
+- When concatenating audio with `-c copy`, ALL input files MUST have identical sample rates. Mismatched rates produce silence/garble. Either generate all inputs at the same rate, or use re-encoding (`-ar <rate>`) in the concat step.
+- Segment cutting with floating-point `-ss`/`-t` accumulates frame-rounding drift when concatenating many segments. Fix: snap timestamps to frame boundaries (`round(t * fps) / fps`) and use `-frames:v N` for exact frame counts instead of `-t duration`.
+- Playwright screenshots of WebAssembly-heavy pages (OpenCascade.js, etc.): use fresh browser per capture to avoid memory leak crashes. Use `wait_until="domcontentloaded"` not `"networkidle"` (WASM keeps connections alive, causing timeout).
