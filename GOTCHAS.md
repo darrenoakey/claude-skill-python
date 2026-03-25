@@ -44,12 +44,6 @@
 - `asyncio.run()` in sync pytest test with pytest-asyncio active: run in `ThreadPoolExecutor` thread instead.
 - Bulk module rename via `.replace("old_name.", "new_name.")` double-hits existing `new_name.old_name.`. Use exact `from old_name`/`import old_name` patterns in a single pass.
 
-## Claude / AI SDK
-- `async for msg in query()` crashes on unknown message types (e.g., `rate_limit_event`). Use manual `__anext__()` with try/except. `ResultMessage` has `.result` (str) not `.content`.
-- `claude_agent_sdk` from sync code: wrap with `asyncio.run()`. Never use `subprocess.run(["claude", ...])` inside Claude Code sessions.
-- `ProcessError` on non-zero exit can happen during teardown after success. Verify via DB/API rather than treating as failure.
-- `query()` from FastAPI background thread: use `ThreadPoolExecutor` + `asyncio.run()` inside the thread.
-
 ## Pyright / Type Checking
 - ABC method returning `AsyncIterator[str]` must be `def stream(...)` (NOT `async def`). Subclasses implement as `async def` with `yield`.
 - `reportMissingImports` for installed packages: use `# pyright: ignore[reportMissingImports]`. Don't touch `site-packages/`.
