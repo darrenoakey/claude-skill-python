@@ -494,6 +494,10 @@ def execute_n8n_workflow(workflow_id: str, data: dict = None) -> dict:
 - httpx (used by `TestClient`) deprecated per-request `cookies=` parameter. With `-W error`, tests setting `cookies={"key": "val"}` on individual `client.get()` calls will fail as `DeprecationWarning`. Fix: set cookies on the client instance via `client.cookies.set("key", "val")` before making requests.
 - `@app.on_event("startup")` is deprecated in favor of `lifespan` context manager: `@asynccontextmanager async def lifespan(app): ... yield ...` passed to `FastAPI(lifespan=lifespan)`.
 
+- Jinja2 template dict fields: avoid naming dict keys `values`, `keys`, `items`, `get`, `update`, or `pop` — these collide with Python dict methods. In Jinja2 `metric.values` resolves to the `dict.values()` method, not a field named "values". Rename to `scenario_values`, `data_values`, etc.
+- FastAPI path parameter ordering: register specific sub-routes like `/budget-mode/new` and `/budget-mode/own/{id}` BEFORE catch-all `/{persona_id}` routes. FastAPI matches first registered route, and `own` will match as a persona_id.
+- SSE + `def` sync endpoints: when SSE streaming coexists with synchronous `def` endpoints that call SQLite, the threadpool works correctly. But `async def` endpoints with sync DB calls block the event loop and stall ALL SSE clients.
+
 ### SQLAlchemy
 - SQLAlchemy + Lambda + PostgreSQL: always use `NullPool` (`from sqlalchemy.pool import NullPool; create_engine(url, poolclass=NullPool)`). Lambda concurrency creates many processes each with their own pool — exhausting `max_connections`. NullPool opens/closes per request.
 - SQLAlchemy dual-DB pattern (SQLite for tests, PostgreSQL for prod): guard DB-specific code with `if engine.url.drivername.startswith("sqlite")` (not `"postgresql"`) for robustness to driver changes.
