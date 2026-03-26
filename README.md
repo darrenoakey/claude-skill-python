@@ -73,3 +73,7 @@ pytest src/path/file_test.py
 3. **Test Failure = Task Failure** - Any failing test means the task is incomplete
 4. **Quality Gates Must Pass** - No commits without passing `./run check`
 5. **DRY > KISS > YAGNI** - Remove duplication first, then simplify, then avoid unneeded features
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
