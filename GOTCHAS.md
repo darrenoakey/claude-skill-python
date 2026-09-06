@@ -31,6 +31,9 @@
 - Tests spawning tmux sessions: set `HOME` to a temp dir and `SHELL=/bin/bash` in TestMain to skip shell init files that can block.
 - Tests for fire-and-forget launchers (`subprocess.Popen(["open", url])`) must NEVER pass valid URLs — they actually open in the browser. Only test rejection of invalid inputs.
 - Pytest `scope="module"` fixtures that bind ports stay alive for the entire module. Standalone tests in the same file that start their own servers MUST use a different port.
+- Under `filterwarnings = ["error"]`, Kokoro/Misaki startup emits `DeprecationWarning: open_text is deprecated. Use files() instead...` from `importlib.resources`. That is third-party G2P lexicon loading, not your code. Suppress only that exact message (and only around the pipeline load/synth call) inside the component that provokes it — never broaden the top-level pytest filter. Prove it with a real engine construction under `simplefilter("error", DeprecationWarning)`, not a source-text assertion.
+- **A Playwright upgrade strands the pinned browser revision.** Every real-browser test fails at once with `Executable doesn't exist at ~/Library/Caches/ms-playwright/chromium_headless_shell-<rev>/...` — the installed browsers are revision-pinned and the upgrade moved the pin (e.g. 1234). Fix is one command in the project venv: `.venv/bin/python -m playwright install chromium` (downloads the matching Chrome-for-Testing + headless shell). Don't weaken or skip the browser tests.
+- **Never smoke-test a heavyweight CLI entrypoint via subprocess inside a per-test-timeout suite.** If importing the entrypoint pulls Apple Vision/AppKit (or any big framework chain), the child pays that startup inside your test's 40s cap and the whole per-file coverage run times out at the gate. Probe the real contract at a cheaper boundary instead: give the function a defaulted path/config parameter and assert the true fail-closed filesystem behavior with a real absent path — real files, no mocks, milliseconds.
 
 ## Python stdlib / Runtime
 - `os.walk()` on NFS can hang indefinitely. Replace with manual BFS + `os.listdir()` in a daemon thread with `queue.get(timeout=N)`.
@@ -71,6 +74,7 @@
 - **CRITICAL** mmap-backed CPU tensors are pathologically slow to `.to("cuda")` — measured 0.17 GB/s effective throughput on GB10 vs 16 GB/s for a heap-allocated tensor of the same size (a **100x slowdown**). Root cause: cudaMemcpy from a file-backed mmap region triggers per-4KB-page faulting serially during the copy, one page fault per 4 KB. Two-line fix: force a `.clone()` before `.to("cuda")` — it does a sequential in-process memcpy from mmap pages into regular heap, then the subsequent cudaMemcpy runs at normal bandwidth. Example: `t = f.get_tensor(name); if target.type == "cuda": t = t.clone(); t = t.to(target)`. Applies to both `safe_open(device="cuda")` (mmap bytes → PyByteArray → `torch.asarray(device="cuda")`) and `safe_open(device="cpu") + .to("cuda")`. Measured real-world impact on LTX-2 pipeline: encode model loading 332s → 22s (15x), total model loading 14.6 min → 1.3 min (11.5x).
 - PyTorch dtype cast via dict comprehension `sd = {k: v.to(dtype=dt) for k, v in old.items()}` holds BOTH the old and new dict in memory for the duration of the comprehension. For a 48 GB fp32 → 24 GB bf16 cast that's a 72 GB peak where 50 GB would suffice. Fix: mutate in place — `for k in list(sd): sd[k] = sd[k].to(dtype=dt)`. Old tensors are freed as each one is replaced, so peak growth is bounded by the largest single tensor. Safe only if no other code holds references to the dict (e.g. a shared Registry cache).
 - HuggingFace model weight dirs sometimes contain TWO shard sets for the same weights — `model-*-of-NN.safetensors` (transformers naming) and `diffusion_pytorch_model-*-of-NN.safetensors` (diffusers naming). A naive `rglob("*.safetensors")` loads both, doubling disk reads and often silently overwriting keys in the target dict. Always drive sharded loading from the `*.safetensors.index.json` file, which names exactly the shards that belong together.
+- Reproducing a HuggingFace causal-LM forward by hand (to re-sequence which layers run, do early-exit, or split the model): call `transformers.masking_utils.create_causal_mask(config, inputs_embeds, attention_mask, past_key_values, position_ids=...)` and the model's OWN `base.rotary_emb(hidden, position_ids)` + `base.embed_tokens` + `base.norm` + `lm_head`, plus the real decoder layers in a loop. NEVER reimplement the causal mask or RoPE yourself — subtle dtype/layout drift breaks bit-exactness and the failure is a tiny logit diff you'll chase for hours. The `create_causal_mask` signature DRIFTS across transformers releases: 5.3 accepted `cache_position=`; 5.14 dropped it (signature is `(config, inputs_embeds, attention_mask, past_key_values, position_ids=None, ...)`). Inspect `inspect.signature(create_causal_mask)` at runtime rather than trusting the source you read. Done this way, a D1 contiguous-layer-group split reproduces `model(input_ids)` to max_abs_logit_diff = **0.00e+00** (bit-identical), not just within tolerance.
 
 ## Web / APIs
 - Browser `getUserMedia()` requires user gesture context. Web Audio nodes must be stored at module/global scope to avoid GC.
@@ -90,3 +94,36 @@
 - Concatenating audio with `-c copy`: ALL inputs MUST have identical sample rates. Use re-encoding (`-ar <rate>`) if mismatched.
 - Floating-point `-ss`/`-t` accumulates drift. Snap to frame boundaries (`round(t * fps) / fps`) and use `-frames:v N`.
 - Playwright screenshots of WebAssembly pages: fresh browser per capture, `wait_until="domcontentloaded"` not `"networkidle"`.
+
+## CI / venv build speed — use `uv`, never `pip`, for heavy dependency sets
+
+Building a venv containing torch / mlx / transformers / opencv with `pip` is
+the kind of thing that quietly eats a CI budget. Measured on an M1 Max for one
+14-line requirements.txt (torch 2.13, mlx, transformers 5.12, opencv, soundfile):
+
+| tool | cold cache | warm cache |
+|---|---|---|
+| `pip install -r` | 63–260s | 63s+ (still re-resolves and re-copies) |
+| `uv venv` + `uv pip install -r` | **24s** | **0.7s** |
+
+- `uv venv <dir>` then `uv pip install --python <dir>/bin/python -r req.txt`.
+  It produces an ordinary venv: `bin/python` works, `-x bin/python` passes, and
+  scripts run normally. Note `uv venv` seeds **no pip/setuptools** by default —
+  fine unless something shells out to `pip` inside the venv.
+- uv **hardlinks** from its wheel cache (`UV_CACHE_DIR`) instead of copying, so
+  each rebuilt venv costs almost no additional disk. The same env built by pip
+  was 1.9G of real bytes; via uv it shares blocks with the 1.6G cache. This
+  matters on a nearly-full disk.
+- uv installs to `~/.local/bin`, which is **not** on a non-interactive PATH.
+  A CI script that sets its own PATH (common, to reach keg-only Homebrew tools)
+  must add `$HOME/.local/bin` explicitly or die with "missing required command".
+- Content-address the venv by `sha256(requirements.txt)` only — never by a
+  broader release hash — so editing application source does not rebuild it.
+- **Publishing a shared cached venv must only ever fill an empty slot.** Build
+  into a temp dir, then re-check for a valid published env before moving; if one
+  appeared, discard your temp copy. `rm -rf` on a valid published venv breaks
+  any concurrent build executing out of it.
+- Build the venv in a **background lane** if the pipeline has unrelated work
+  (compiling, other test suites). A dependency install is network/disk bound and
+  needs no CPU from the rest of the pipeline; overlapped, even a genuine cold
+  24s build costs zero wall time.
